@@ -34,9 +34,9 @@ Public URL: `https://web-production-35eb3.up.railway.app`
 
 ## Available Slash Commands
 
-- `/shutdown` - Safely stop services in the correct order
-- `/restart` - Restart services after shutdown or for redeploy
-- `/status` - Report current state of all four services
+- `/shutdown` - Stop web and worker via `railway down` (Level B). Postgres and Redis are left running.
+- `/restart` - Restart web and worker, choosing `railway up` or `railway redeploy` per service based on GraphQL-queried state.
+- `/status` - Report current state of all four services via GraphQL. Read-only.
 
 ## Local Development
 
@@ -48,3 +48,15 @@ The repo includes `docker-compose.yml` mirroring the Railway topology. Run `dock
 2. Rotate Postgres password (exposed during initial provisioning).
 3. Modify `deployment/server-entrypoint.sh` to bind Gunicorn to `$PORT` with fallback to 8000.
 4. Verify healthcheck endpoint at `/healthcheck/`.
+
+## Railway Platform Gotchas
+
+Observed behaviors of the Railway CLI (5.30.1) and GraphQL API on this project. These constrain how shutdown, restart, and status commands are implemented.
+
+1. **`railway scale replicas=0` silently no-ops.** On CLI 5.30.1, the command returns success but does not scale the service. Do not use for shutdowns.
+
+2. **`deploymentStop` GraphQL mutation is inconsistent.** In one observed session, the mutation succeeded on the worker service and no-op'd on the web service without an error. Do not rely on it as a shutdown mechanism. Use `railway down --service <name>` instead.
+
+3. **Verify shutdown effectiveness by querying `latestDeployment` via GraphQL.** CLI return codes do not reliably reflect deployment state after shutdown attempts. Query the service's latest deployment and inspect `deploymentStopped` or the absence of deployments in `edges` to confirm the stopped state.
+
+4. **`railway status --service <name>` is not supported on CLI 5.30.1.** The `--service` flag is rejected. For per-service status, use the GraphQL `service` query with a `deployments(first: 1)` selection instead.

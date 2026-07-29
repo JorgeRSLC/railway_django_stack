@@ -1,46 +1,95 @@
-# Restart Procedure
+# /restart
 
-Determine restart context first:
+Restarts the web and worker services on Railway. Handles the case where the two services may be in different stopped states.
 
-- **Live restart (no code change):** Use `railway redeploy --service <name>` per service.
-- **Restart after Level A pause:** Use dashboard resume or `railway service` resume commands.
-- **Restart after Level B removal:** Use `railway up --service <name>` per service.
-- **Restart after code changes:** Same as Level B, but ensure changes are committed and pushed to `main` first.
+## Mechanism
 
-## Execution order
+Queries each service's `latestDeployment` via GraphQL. Chooses the restart mechanism per service based on the result:
 
-1. Confirm restart context with operator.
+- If no deployment exists (Level B removal): `railway up --service <name> --detach` rebuilds from the local working tree.
+- If a deployment exists with `deploymentStopped=true` (Level A stop): `railway redeploy --service <name>` redeploys the retained build.
+- If a deployment exists and is running: skip the service.
 
-2. Ensure Postgres and Redis are running. If paused, resume first. Verify:
-   - `railway status --service Postgres`
-   - `railway status --service Redis`
+Reports the mechanism used per service.
 
-3. Restart / redeploy web service:
-   - Live: `railway redeploy --service web`
-   - After Level B: `railway up --service web --detach`
-   Wait 60 seconds, then check `railway status --service web`.
+## Prerequisites
 
-4. Restart / redeploy worker service:
-   - Live: `railway redeploy --service worker`
-   - After Level B: `railway up --service worker --detach`
-   Wait 60 seconds, then check `railway status --service worker`.
+- Local working tree at `C:\Dev\railway_django_stack` is on the intended commit.
+- Railway CLI is authenticated and linked to the `railway_django_stack` project.
+- Project access token is available for GraphQL queries.
 
-5. Verify web reachability:
-   - `curl -I https://web-production-35eb3.up.railway.app`
-   - Expected: HTTP status 200, 301, 302, or 404 (Django-generated).
-   - If 502 with `x-railway-fallback: true`, verify domain target port is 8000 via GraphQL:
-     `query { serviceInstance(serviceId: "c0edfdd1-b351-40c9-9745-c514cc00817c", environmentId: "555ff3e9-fabb-47b8-91e7-71c233f58b4c") { domains { targetPort } } }`
+## Steps
 
-6. Verify Celery worker:
-   - `railway logs --service worker --deployment | tail -n 50`
-   - Expected: `celery@... ready`, `Connected to redis://default:**@redis.railway.internal:6379//`.
-   - No `gunicorn` output (would indicate startCommand was lost; re-apply via `serviceInstanceUpdate` mutation).
+1. Confirm the operator wants to restart. Ask explicitly.
 
-7. Verify variable references still resolve:
-   - `railway variables --service web`
-   - `railway variables --service worker`
-   - Confirm PGHOST, REDISHOST, REDISUSER, REDISPASSWORD have valid values.
+2. For each service (web, then worker), query the latest deployment:
 
-8. Report final state to operator.
+```
+   query {
+     service(id: "<service_id>") {
+       name
+       deployments(first: 1) {
+         edges { node { id status deploymentStopped canRedeploy } }
+       }
+     }
+   }
+```
 
-Do not modify repo files during restart unless code changes were the trigger.
+3. Determine the restart mechanism per service:
+
+   - Empty `edges` array: use `railway up`.
+   - Non-empty with `deploymentStopped=true`: use `railway redeploy`.
+   - Non-empty with `deploymentStopped=false` and a running status: skip.
+
+4. Execute the chosen mechanism per service. Web first, worker second (matches the migration ordering rule).
+
+   Rebuild path:
+
+```
+   railway up --service <name> --detach
+```
+
+   Redeploy path:
+
+```
+   railway redeploy --service <name> --yes
+```
+
+5. Verify each service reaches a running state. Query GraphQL again and confirm the latest deployment is `SUCCESS` with `deploymentStopped=false`.
+
+   For web, additionally verify the public URL no longer returns the Railway edge fallback. The distinguishing signal is the `x-railway-fallback: true` header, not the status code:
+
+```
+   curl.exe -I https://web-production-35eb3.up.railway.app
+```
+
+   Expect the header to be absent. A 404 without the fallback header indicates a running Django app with no route at `/` and is acceptable.
+
+   - Worker verification: check recent logs for the Celery ready banner and confirm no Gunicorn output:
+
+```
+     railway logs --service worker --deployment | Select-Object -Last 100
+```
+
+     Expect `celery@... ready`. Gunicorn lines indicate the start command was not applied and the worker booted as web.
+
+   - Reference variable resolution: confirm `PGHOST`, `REDISHOST`, `REDISUSER`, and `REDISPASSWORD` resolve to non-empty values on both services:
+
+```
+     railway variables --service web
+     railway variables --service worker
+```
+
+     Empty or literal `${{...}}` values indicate a stale reference, usually from a recreated Postgres or Redis service.
+
+6. Report per service: the mechanism used, the final deployment status, and any anomalies.
+
+## Ordering
+
+Web restarts before worker. This matches the migration ordering rule from `CLAUDE.md` §5: the web entrypoint runs `manage.py migrate` on startup, and the worker should not run against a schema that has not yet been migrated.
+
+## Failure handling
+
+If a `railway up` build fails, report the build log location and stop. Do not attempt to restart the other service.
+
+If a `railway redeploy` fails with an error indicating the retained deployment is no longer valid, fall back to `railway up --service <name> --detach` and report the fallback.
